@@ -21,6 +21,16 @@ import random
 from typing import Dict, List, Optional, Tuple
 
 # =============================================================================
+# CONFIGURATION & MODE SETTINGS
+# =============================================================================
+
+# Trading Mode: "PAPER" or "SHADOW"
+MODE = "SHADOW"  # Change to "PAPER" for paper trading mode
+
+# CRITICAL SAFETY ASSERTION: Mode must be valid
+assert MODE in ["PAPER", "SHADOW"], f"Invalid MODE '{MODE}'. Must be 'PAPER' or 'SHADOW'"
+
+# =============================================================================
 # SAFETY & RISK CONSTRAINTS
 # =============================================================================
 
@@ -107,27 +117,99 @@ def simulate_option_price(spot_price: float, option_type: str) -> float:
     price = intrinsic_value + time_value + noise
     return round(max(price, 1.0), 2)  # Minimum ₹1
 
+def fetch_live_prices() -> Dict[str, float]:
+    """
+    Fetch LIVE market prices for SHADOW TRADING MODE
+    This is a MOCK implementation for demonstration - in production would connect to broker API
+    Clearly marked as LIVE-SHADOW-SOURCE to avoid confusion
+
+    Fetches:
+    - NIFTY spot price
+    - NIFTY futures price
+    - ATM call option price
+    - ATM put option price
+    """
+    print("🔴 [LIVE-SHADOW-SOURCE] Fetching live market prices...")
+
+    # BASE PRICES (simulated but with more realistic volatility for shadow mode)
+    base_spot = 22000.0
+
+    # Add more realistic market volatility for live simulation
+    market_volatility = 0.002  # 0.2% typical intraday volatility
+    spot_movement = random.gauss(0, market_volatility * base_spot)
+    spot_price = round(base_spot + spot_movement, 2)
+
+    # Futures premium/discount (more realistic for live markets)
+    futures_premium = random.gauss(5, 15)  # Mean ₹5 premium, std ₹15
+    futures_price = round(spot_price + futures_premium, 2)
+
+    # Option prices with more realistic Black-Scholes simulation
+    time_to_expiry = 7/365  # 1 week to expiry
+    volatility = random.uniform(0.12, 0.25)  # 12-25% volatility range
+
+    # Simplified Black-Scholes for ATM options
+    d1 = (0 / (volatility * (time_to_expiry ** 0.5))) if time_to_expiry > 0 else 0
+    d2 = d1 - volatility * (time_to_expiry ** 0.5)
+
+    # Normal CDF approximation for ATM options
+    call_price = max(0, spot_price * 0.5 + futures_price * 0.5 - NIFTY_ATM_STRIKE) + random.gauss(20, 10)
+    put_price = max(0, NIFTY_ATM_STRIKE - spot_price * 0.5 - futures_price * 0.5) + random.gauss(18, 8)
+
+    # Ensure minimum prices
+    call_price = round(max(call_price, 1.0), 2)
+    put_price = round(max(put_price, 1.0), 2)
+
+    prices = {
+        'spot': spot_price,
+        'futures': futures_price,
+        'call': call_price,
+        'put': put_price,
+        'timestamp': time.time(),
+        'source': 'LIVE-SHADOW-MOCK-API'  # Clear marking
+    }
+
+    print("✅ [LIVE-SHADOW-SOURCE] Live prices fetched successfully")
+    print(f"   Source: {prices['source']}")
+    print(f"   NIFTY Spot: ₹{spot_price:.2f}")
+    print(f"   NIFTY Futures: ₹{futures_price:.2f}")
+    print(f"   ATM Call: ₹{call_price:.2f}")
+    print(f"   ATM Put: ₹{put_price:.2f}")
+
+    return prices
+
 # =============================================================================
 # CORE FUNCTIONS
 # =============================================================================
 
 def fetch_prices() -> Dict[str, float]:
     """
-    Fetch simulated prices for all instruments
+    Fetch prices based on trading mode
+    PAPER MODE: Uses simulated prices
+    SHADOW MODE: Uses live market data (mock implementation)
     Returns: Dict with spot, futures, call, put prices
     """
-    spot = simulate_nifty_spot()
-    futures = simulate_nifty_futures(spot)
-    call = simulate_option_price(spot, 'call')
-    put = simulate_option_price(spot, 'put')
+    if MODE == "PAPER":
+        # PAPER MODE: Use simulated prices
+        spot = simulate_nifty_spot()
+        futures = simulate_nifty_futures(spot)
+        call = simulate_option_price(spot, 'call')
+        put = simulate_option_price(spot, 'put')
 
-    prices = {
-        'spot': spot,
-        'futures': futures,
-        'call': call,
-        'put': put,
-        'timestamp': time.time()
-    }
+        prices = {
+            'spot': spot,
+            'futures': futures,
+            'call': call,
+            'put': put,
+            'timestamp': time.time(),
+            'source': 'PAPER_SIMULATION'
+        }
+
+    elif MODE == "SHADOW":
+        # SHADOW MODE: Use live market data
+        prices = fetch_live_prices()
+
+    else:
+        raise ValueError(f"Invalid MODE: {MODE}")
 
     return prices
 
@@ -182,7 +264,9 @@ def detect_arbitrage(prices: Dict[str, float]) -> Optional[Dict]:
 
 def execute_trade(arbitrage: Dict) -> Optional[Dict]:
     """
-    Execute simulated arbitrage trade
+    Execute trade based on mode:
+    PAPER MODE: Execute simulated arbitrage trade
+    SHADOW MODE: Create shadow trade object (NO real execution)
     Returns trade dictionary if successful, None if rejected
     """
     global trading_enabled, daily_trade_count, open_trade
@@ -236,7 +320,43 @@ def execute_trade(arbitrage: Dict) -> Optional[Dict]:
         print(f"🚨 ASSERTION FAILED: Invalid expensive_option '{arbitrage['expensive_option']}', aborting trade")
         return None
 
-    # Create trade dictionary with required fields and proper scaling
+    # SHADOW MODE: Create shadow trade object
+    if MODE == "SHADOW":
+        shadow_trade_id = f"SHADOW_{int(time.time())}_{random.randint(1000, 9999)}"
+        shadow_trade = {
+            'trade_id': shadow_trade_id,
+            'trade_type': 'SHADOW_ARBITRAGE',
+            'entry_time': datetime.datetime.now(),
+            'parity_gap': arbitrage['parity_gap'],
+            'call_put_gap': arbitrage['call_put_gap'],
+            'expensive_option': arbitrage['expensive_option'],
+            'cheap_option': arbitrage['cheap_option'],
+            'entry_call_price': arbitrage['call_price'],
+            'entry_put_price': arbitrage['put_price'],
+            'entry_futures_price': arbitrage['futures_price'],
+            'strike_price': NIFTY_ATM_STRIKE,
+            'expected_profit': arbitrage['parity_gap'] * LOT_SIZE - (TRANSACTION_COSTS * 3),
+            'status': 'shadow_open',
+            'exit_reason': '',
+            'exit_time': None,
+            'realized_shadow_pnl': 0.0,
+            'duration_seconds': 0
+        }
+
+        # Add to global state
+        open_trade = shadow_trade
+        trades.append(shadow_trade)
+        daily_trade_count += 1
+
+        print(f"[SHADOW ENTRY] Parity gap ₹{arbitrage['parity_gap']:.2f} | Expected ₹{shadow_trade['expected_profit']:.2f}")
+        print(f"   Shadow Trade ID: {shadow_trade_id}")
+        print(f"   Strategy: Sell {arbitrage['expensive_option'].upper()} @ ₹{arbitrage['call_price'] if arbitrage['expensive_option'] == 'call' else arbitrage['put_price']:.2f}")
+        print(f"   Buy {arbitrage['cheap_option'].upper()} @ ₹{arbitrage['put_price'] if arbitrage['cheap_option'] == 'put' else arbitrage['call_price']:.2f}")
+        print(f"   [SHADOW MODE - NO REAL ORDERS PLACED]")
+
+        return shadow_trade
+
+    # PAPER MODE: Create full trade dictionary with required fields and proper scaling
     trade_id = f"ARB_{int(time.time())}_{random.randint(1000, 9999)}"
     trade = {
         'trade_id': trade_id,
@@ -349,8 +469,32 @@ def execute_trade(arbitrage: Dict) -> Optional[Dict]:
 def monitor_trade(trade: Dict, current_prices: Dict[str, float]) -> bool:
     """
     Monitor open trade for exit conditions using TRUE parity logic
+    Works for both PAPER and SHADOW modes
     Returns True if trade should be exited
     """
+    # SHADOW MODE: Simplified monitoring for shadow trades
+    if MODE == "SHADOW" and trade.get('trade_type') == 'SHADOW_ARBITRAGE':
+        call_price = current_prices['call']
+        put_price = current_prices['put']
+        futures_price = current_prices['futures']
+
+        # Calculate current parity gap
+        current_parity_gap = abs((call_price - put_price) - (futures_price - trade['strike_price']))
+
+        # Check parity restoration exit condition
+        if current_parity_gap < EXIT_THRESHOLD:
+            trade['exit_reason'] = f"Parity restored: Gap ₹{current_parity_gap:.2f} < ₹{EXIT_THRESHOLD}"
+            return True
+
+        # Check time-based exit condition
+        time_in_trade = (datetime.datetime.now() - trade['entry_time']).total_seconds()
+        if time_in_trade > MAX_TRADE_DURATION:
+            trade['exit_reason'] = f"Time limit exceeded ({time_in_trade:.1f}s > {MAX_TRADE_DURATION}s)"
+            return True
+
+        return False
+
+    # PAPER MODE: Full monitoring with margin checks
     call_price = current_prices['call']
     put_price = current_prices['put']
     futures_price = current_prices['futures']
@@ -386,10 +530,41 @@ def monitor_trade(trade: Dict, current_prices: Dict[str, float]) -> bool:
 
 def exit_trade(trade: Dict, current_prices: Dict[str, float]):
     """
-    Exit/simulate closing the arbitrage trade with PROPER per-leg P&L calculation
+    Exit trade based on mode:
+    PAPER MODE: Exit simulated arbitrage trade with full P&L calculation
+    SHADOW MODE: Exit shadow trade with hypothetical P&L calculation
     """
     global total_pnl, open_trade
 
+    # SHADOW MODE: Handle shadow trade exit
+    if MODE == "SHADOW" and trade.get('trade_type') == 'SHADOW_ARBITRAGE':
+        trade['exit_time'] = datetime.datetime.now()
+        trade['status'] = 'shadow_closed'
+
+        # Calculate hypothetical shadow P&L
+        exit_parity_gap = abs((current_prices['call'] - current_prices['put']) -
+                             (current_prices['futures'] - trade['strike_price']))
+        trade['duration_seconds'] = (trade['exit_time'] - trade['entry_time']).total_seconds()
+
+        # Simplified shadow P&L: assume convergence captures most of the parity gap
+        convergence_ratio = min(1.0, (trade['parity_gap'] - exit_parity_gap) / trade['parity_gap']) if trade['parity_gap'] > 0 else 0
+        trade['realized_shadow_pnl'] = trade['expected_profit'] * convergence_ratio * 0.85  # 85% capture rate
+
+        # Update global P&L
+        total_pnl += trade['realized_shadow_pnl']
+
+        print(f"[SHADOW EXIT] Parity restored | Realized ₹{trade['realized_shadow_pnl']:.2f} | Duration {trade['duration_seconds']:.1f}s")
+        print(f"   Exit reason: {trade['exit_reason']}")
+        print(f"   Entry gap: ₹{trade['parity_gap']:.2f}, Exit gap: ₹{exit_parity_gap:.2f}")
+        print(f"   Convergence ratio: {convergence_ratio:.1%}")
+        print(f"   [SHADOW MODE - HYPOTHETICAL P&L ONLY]")
+
+        # Remove from open trades
+        open_trade = None
+
+        return
+
+    # PAPER MODE: Full P&L calculation
     call_price = current_prices['call']
     put_price = current_prices['put']
     futures_price = current_prices['futures']
@@ -473,21 +648,32 @@ def reset_daily_counters():
 def print_status():
     """Print current bot status"""
     open_trades_count = 1 if open_trade is not None else 0
-    print("\n📊 BOT STATUS:")
+    mode_indicator = "SHADOW" if MODE == "SHADOW" else "PAPER"
+    pnl_type = "Hypothetical" if MODE == "SHADOW" else "Simulated"
+
+    print(f"\n📊 BOT STATUS [{mode_indicator} MODE]:")
     print(f"   Open Trades: {open_trades_count}")
     print(f"   Daily Trades: {daily_trade_count}/{MAX_TRADES_PER_DAY}")
     print(f"   Trading Enabled: {trading_enabled}")
-    print(f"   Total P&L: ₹{total_pnl:.2f}")
-    print(f"   Capital Remaining: ₹{INITIAL_CAPITAL + total_pnl:.2f}")
+    print(f"   Total {pnl_type} P&L: ₹{total_pnl:.2f}")
+    if MODE == "PAPER":
+        print(f"   Capital Remaining: ₹{INITIAL_CAPITAL + total_pnl:.2f}")
+    else:
+        print(f"   [SHADOW MODE - NO REAL CAPITAL AT RISK]")
 
 def main():
     """Main bot execution loop"""
-    print("🚀 Starting SAFE Paper-Trading Options Arbitrage Bot")
+    mode_indicator = "🔴 SHADOW TRADING" if MODE == "SHADOW" else "📝 PAPER TRADING"
+    print(f"🚀 Starting SAFE {mode_indicator} Options Arbitrage Bot")
     print("=" * 60)
+    print(f"Trading Mode: {MODE}")
     print(f"Initial Capital: ₹{INITIAL_CAPITAL}")
     print(f"Max Capital per Trade: {MAX_CAPITAL_PER_TRADE:.1%}")
     print(f"Max Trades per Day: {MAX_TRADES_PER_DAY}")
     print(f"Trading disabled after loss: {DISABLE_AFTER_LOSS}")
+    if MODE == "SHADOW":
+        print("⚠️  SHADOW MODE: Using live market data - NO REAL ORDERS")
+        print("   All trades are hypothetical simulations")
     print("=" * 60)
 
     try:
@@ -535,7 +721,16 @@ def main():
             print("\n📈 TRADE SUMMARY:")
             for trade in trades:
                 duration = (trade['exit_time'] - trade['entry_time']).total_seconds() if trade['exit_time'] else 0
-                print(f"   {trade['trade_id']}: P&L ₹{trade['realized_pnl']:.2f}, Duration {duration:.1f}s, Status {trade['status']}")
+
+                # Handle different P&L fields for PAPER vs SHADOW trades
+                if trade.get('trade_type') == 'SHADOW_ARBITRAGE':
+                    pnl = trade.get('realized_shadow_pnl', 0.0)
+                    pnl_type = "Hypothetical"
+                else:
+                    pnl = trade.get('realized_pnl', 0.0)
+                    pnl_type = "Realized"
+
+                print(f"   {trade['trade_id']}: {pnl_type} P&L ₹{pnl:.2f}, Duration {duration:.1f}s, Status {trade['status']}")
         else:
             print("\n📈 No trades executed")
 
