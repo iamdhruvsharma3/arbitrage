@@ -22,8 +22,13 @@ import requests
 import json
 import csv
 import os
+import sys
+import threading
 from typing import Dict, List, Optional, Tuple
 from broker_data_provider import create_market_data_provider, MarketData
+
+# WebSocket imports for live market data
+from kiteconnect import KiteConnect, KiteTicker
 
 # =============================================================================
 # CONFIGURATION & MODE SETTINGS
@@ -59,7 +64,9 @@ DISABLE_AFTER_LOSS = True  # Stop trading after one losing trade
 TRANSACTION_COSTS = 5.0   # Fixed ₹5 per trade leg (realistic for simulation)
 MIN_PROFIT_THRESHOLD = 2.0  # Minimum ₹2 profit threshold
 EXIT_THRESHOLD = 10.0  # Exit when gap < ₹10
+EXIT_HOLD_TIME = 3.0  # Hold exit condition for 3 seconds for stable convergence
 MAX_TRADE_DURATION = 300  # Maximum 5 minutes (300 seconds) per trade
+HEARTBEAT_INTERVAL = 0.5  # Heartbeat loop interval (500ms)
 
 # Market Parameters
 NIFTY_ATM_STRIKE = 22000  # Default ATM strike (will be updated dynamically in real data)
@@ -81,6 +88,519 @@ daily_trade_count = 0
 last_reset_date = datetime.date.today()
 trading_enabled = True
 total_pnl = 0.0
+
+# WebSocket price cache and state
+price_cache = {
+    "spot": None,
+    "futures": None,
+    "call": None,
+    "put": None,
+    "timestamp": None,
+    "atm_strike": None
+}
+websocket_connected = False
+kite_ticker = None
+instrument_tokens = {
+    "spot": None,      # NIFTY spot instrument token
+    "futures": None,   # NIFTY futures instrument token
+    "call": None,      # ATM call instrument token
+    "put": None        # ATM put instrument token
+}
+last_arbitrage_check = 0.0  # Timestamp of last arbitrage evaluation
+heartbeat_thread = None  # Global heartbeat thread reference
+
+class ShutdownHandler:
+    """Handles graceful shutdown signals"""
+    def __init__(self):
+        self.shutdown_event = threading.Event()
+
+    def set_shutdown(self):
+        """Set shutdown event"""
+        print("\n🛑 Shutdown signal received...")
+        self.shutdown_event.set()
+
+    def is_shutdown_set(self):
+        """Check if shutdown is requested"""
+        return self.shutdown_event.is_set()
+
+# Thread-safe price cache access
+price_cache_lock = threading.Lock()
+
+# Global shutdown handler
+shutdown_handler = ShutdownHandler()
+
+# =============================================================================
+# HEARTBEAT LOOP - TIME-DRIVEN TRADE LIFECYCLE
+# =============================================================================
+
+def heartbeat_loop():
+    """
+    Deterministic heartbeat loop that evaluates trade lifecycle based on time.
+    Runs independently of WebSocket ticks to ensure exit conditions are always enforced.
+    """
+    global open_trade
+
+    print(f"[HEARTBEAT STARTED] interval={HEARTBEAT_INTERVAL}s")
+
+    while not shutdown_handler.is_shutdown_set():
+        try:
+            # Get latest prices from cache (thread-safe, non-blocking)
+            prices = get_prices_from_cache()
+
+            if not prices:
+                # No complete price data available, skip this cycle
+                time.sleep(HEARTBEAT_INTERVAL)
+                continue
+
+            if open_trade is None:
+                # No open trade - check for entry opportunities
+                arbitrage = detect_arbitrage(prices)
+                if arbitrage:
+                    # Execute trade if arbitrage found
+                    trade = execute_trade(arbitrage)
+                    if trade:
+                        # Trade was opened, will be monitored in next heartbeat
+                        pass
+            else:
+                # Open trade exists - monitor for exit conditions
+                should_exit = monitor_trade(open_trade, prices)
+                if should_exit:
+                    # Exit the trade
+                    exit_trade(open_trade, prices)
+                    open_trade = None  # Trade is now closed
+
+            # Log heartbeat status (throttled to avoid spam)
+            if int(time.time()) % 5 == 0:  # Every 5 seconds
+                trade_status = "none"
+                if open_trade:
+                    trade_age = (datetime.datetime.now() - open_trade['entry_time']).total_seconds()
+                    trade_status = f"open | age={trade_age:.0f}s"
+                print(f"[HEARTBEAT] trade={trade_status}")
+
+        except Exception as e:
+            print(f"❌ [HEARTBEAT ERROR] {e}")
+            # Continue running despite errors
+
+        # Sleep for next heartbeat
+        time.sleep(HEARTBEAT_INTERVAL)
+
+    print("[HEARTBEAT STOPPED]")
+
+def start_heartbeat_loop():
+    """Start the heartbeat loop in a daemon thread"""
+    global heartbeat_thread
+
+    if heartbeat_thread and heartbeat_thread.is_alive():
+        print("⚠️  [HEARTBEAT] Already running")
+        return
+
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True, name="HeartbeatLoop")
+    heartbeat_thread.start()
+    print("✅ [HEARTBEAT] Thread started")
+
+def stop_heartbeat_loop():
+    """Stop the heartbeat loop"""
+    global heartbeat_thread
+
+    if heartbeat_thread and heartbeat_thread.is_alive():
+        print("[HEARTBEAT STOPPING] Waiting for thread...")
+        heartbeat_thread.join(timeout=2.0)
+        if heartbeat_thread.is_alive():
+            print("⚠️  [HEARTBEAT] Thread did not stop gracefully")
+        else:
+            print("✅ [HEARTBEAT STOPPED]")
+
+# =============================================================================
+# WEBSOCKET PRICE CACHE MANAGEMENT
+# =============================================================================
+
+def update_price_cache(instrument_token: int, price: float):
+    """
+    Update the price cache with new tick data.
+    instrument_token: Zerodha instrument token
+    price: Last traded price from tick
+    Thread-safe: uses lock for concurrent access
+    """
+    global price_cache, NIFTY_ATM_STRIKE
+
+    current_time = time.time()
+
+    # Map instrument token to price type
+    price_type = None
+    for key, token in instrument_tokens.items():
+        if token == instrument_token:
+            price_type = key
+            break
+
+    if price_type:
+        with price_cache_lock:
+            price_cache[price_type] = price
+            price_cache['timestamp'] = current_time
+
+            # Update ATM strike if we have spot price
+            if price_type == 'spot':
+                NIFTY_ATM_STRIKE = round(price / 50) * 50
+                price_cache['atm_strike'] = NIFTY_ATM_STRIKE
+
+        print(f"📊 [WS PRICE] {price_type.upper()}: ₹{price:.2f}")
+
+def is_price_cache_complete() -> bool:
+    """
+    Check if all required prices are available in the cache.
+    Returns True if all four prices (spot, futures, call, put) are present.
+    """
+    required_prices = ['spot', 'futures', 'call', 'put']
+    return all(price_cache.get(key) is not None for key in required_prices)
+
+def get_prices_from_cache() -> Optional[Dict[str, float]]:
+    """
+    Get complete price data from cache with timestamp validation.
+    Returns normalized price dictionary or None if incomplete/invalid.
+    Thread-safe: uses lock for concurrent access
+    """
+    with price_cache_lock:
+        if not is_price_cache_complete():
+            return None
+
+        current_time = time.time()
+        cache_timestamp = price_cache.get('timestamp', 0)
+
+        # Check if cache data is fresh (within 30 seconds)
+        if current_time - cache_timestamp > 30:
+            print("⚠️  [CACHE] Price cache data is stale (>30s old)")
+            return None
+
+        # Return normalized price data
+        return {
+            'spot': price_cache['spot'],
+            'futures': price_cache['futures'],
+            'call': price_cache['call'],
+            'put': price_cache['put'],
+            'timestamp': cache_timestamp,
+            'source': 'WEBSOCKET_LIVE',
+            'atm_strike': price_cache.get('atm_strike', NIFTY_ATM_STRIKE)
+        }
+
+def clear_price_cache():
+    """Clear all prices from cache (used on disconnection/reconnection)"""
+    global price_cache
+    for key in price_cache:
+        price_cache[key] = None
+    print("🧹 [CACHE] Price cache cleared")
+
+# =============================================================================
+# KITE TICKER WEBSOCKET HANDLER
+# =============================================================================
+
+class ArbitrageTicker:
+    """
+    KiteTicker WebSocket handler for arbitrage bot.
+    Handles connection, ticks, and error events.
+    """
+
+    def __init__(self, api_key: str, access_token: str):
+        self.api_key = api_key
+        self.access_token = access_token
+        self.kite_ticker = None
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+
+    def on_connect(self, ws, response):
+        """Called when WebSocket connection is established"""
+        global websocket_connected
+        self.connected = True
+        websocket_connected = True
+        self.reconnect_attempts = 0
+        print("[WS CONNECTED] Zerodha KiteTicker WebSocket connected successfully")
+
+        # Subscribe to instruments
+        tokens_to_subscribe = [token for token in instrument_tokens.values() if token is not None]
+        if tokens_to_subscribe:
+            self.kite_ticker.subscribe(tokens_to_subscribe)
+            self.kite_ticker.set_mode(self.kite_ticker.MODE_LTP, tokens_to_subscribe)
+            print(f"[WS SUBSCRIBE] Subscribed to {len(tokens_to_subscribe)} instruments: {tokens_to_subscribe}")
+        else:
+            print("❌ [WS SUBSCRIBE] No instrument tokens available for subscription")
+
+    def on_ticks(self, ws, ticks):
+        """Called when tick data is received - DATA INGESTION ONLY"""
+        # Check for shutdown signal
+        if shutdown_handler.is_shutdown_set():
+            print("🛑 Shutdown signal detected - closing WebSocket connection...")
+            ws.close()
+            return
+
+        # Only update price cache - no strategy logic here
+        for tick in ticks:
+            instrument_token = tick['instrument_token']
+            price = tick['last_price']
+            update_price_cache(instrument_token, price)
+
+        # Log tick activity (throttled to avoid spam)
+        if int(time.time()) % 10 == 0:  # Every 10 seconds
+            print(f"[WS] Received {len(ticks)} ticks - data ingestion active")
+
+    def on_close(self, ws, code, reason):
+        """Called when WebSocket connection is closed"""
+        global websocket_connected
+        self.connected = False
+        websocket_connected = False
+        print(f"[WS DISCONNECTED] Code: {code}, Reason: {reason}")
+
+        # Clear price cache on disconnection
+        clear_price_cache()
+
+        # Note: Shutdown handling is now done in main function
+
+        # Attempt reconnection for non-shutdown disconnections
+        self._attempt_reconnect()
+
+    def on_error(self, ws, code, reason):
+        """Called when WebSocket error occurs"""
+        print(f"❌ [WS ERROR] Code: {code}, Reason: {reason}")
+
+    def on_reconnect(self, ws, attempts_count):
+        """Called when attempting reconnection"""
+        print(f"[WS RECONNECTING] Attempt {attempts_count}/{self.max_reconnect_attempts}")
+
+    def on_noreconnect(self, ws):
+        """Called when reconnection fails"""
+        print("❌ [WS RECONNECT FAILED] Maximum reconnection attempts reached")
+        print("   WebSocket will not reconnect automatically")
+
+    def _attempt_reconnect(self):
+        """Attempt to reconnect WebSocket"""
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            self.reconnect_attempts += 1
+            print(f"[WS RECONNECT] Attempting reconnection {self.reconnect_attempts}/{self.max_reconnect_attempts}")
+
+            try:
+                self.start()
+            except Exception as e:
+                print(f"❌ [WS RECONNECT] Failed: {e}")
+                time.sleep(2)  # Wait before next attempt
+        else:
+            print("❌ [WS RECONNECT] Maximum attempts reached, giving up")
+
+    def start(self):
+        """Start the WebSocket connection synchronously"""
+        try:
+            self.kite_ticker = KiteTicker(self.api_key, self.access_token)
+
+            # Set event handlers
+            self.kite_ticker.on_connect = self.on_connect
+            self.kite_ticker.on_ticks = self.on_ticks
+            self.kite_ticker.on_close = self.on_close
+            self.kite_ticker.on_error = self.on_error
+            self.kite_ticker.on_reconnect = self.on_reconnect
+            self.kite_ticker.on_noreconnect = self.on_noreconnect
+
+            print("[WS STARTING] Connecting to Zerodha KiteTicker WebSocket...")
+            print("   Press Ctrl+C to stop")
+
+            # Connect to WebSocket synchronously
+            self.kite_ticker.connect()
+
+        except Exception as e:
+            print(f"❌ [WS START] Failed to start WebSocket: {e}")
+            raise
+
+    def stop(self):
+        """Stop the WebSocket connection"""
+        if self.kite_ticker and self.connected:
+            print("[WS STOPPING] Disconnecting WebSocket...")
+            self.kite_ticker.close()
+            self.connected = False
+            websocket_connected = False
+        else:
+            print("[WS STOP] WebSocket not connected")
+
+def initialize_websocket() -> Optional[ArbitrageTicker]:
+    """
+    Initialize WebSocket connection for live market data.
+    Returns ArbitrageTicker instance if successful, None otherwise.
+    """
+    try:
+        api_key = os.getenv('BROKER_API_KEY')
+        access_token = os.getenv('ZERODHA_ACCESS_TOKEN')
+
+        if not api_key or not access_token:
+            print("❌ [WEBSOCKET] Missing BROKER_API_KEY or ZERODHA_ACCESS_TOKEN")
+            print("   Run zerodha_oauth_helper.py first to get access token")
+            return None
+
+        print("🔌 [WEBSOCKET] Initializing Zerodha KiteTicker for live market data...")
+
+        ticker = ArbitrageTicker(api_key, access_token)
+        return ticker
+
+    except Exception as e:
+        print(f"❌ [WEBSOCKET] Initialization failed: {e}")
+        return None
+
+# =============================================================================
+# WEBSOCKET INSTRUMENT LOOKUP
+# =============================================================================
+
+def lookup_instrument_tokens() -> bool:
+    """
+    Lookup instrument tokens for WebSocket subscription.
+    Returns True if all tokens found successfully.
+    """
+    global instrument_tokens
+
+    try:
+        # Initialize KiteConnect for instrument lookup
+        api_key = os.getenv('BROKER_API_KEY')
+        access_token = os.getenv('ZERODHA_ACCESS_TOKEN')
+
+        if not api_key or not access_token:
+            print("❌ [WEBSOCKET] Missing API_KEY or ACCESS_TOKEN for instrument lookup")
+            return False
+
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+
+        print("🔍 [WEBSOCKET] Looking up instrument tokens...")
+
+        # Get both NSE and NFO instruments
+        nse_instruments = kite.instruments(exchange=kite.EXCHANGE_NSE)
+        nfo_instruments = kite.instruments(exchange="NFO")
+
+        # Find NIFTY 50 spot (index) - it's in NSE instruments
+        nifty_spot = None
+        for inst in nse_instruments:
+            if inst['tradingsymbol'] == 'NIFTY 50':
+                nifty_spot = inst
+                break
+
+        if not nifty_spot:
+            print("❌ [WEBSOCKET] NIFTY 50 spot instrument not found")
+            return False
+
+        instrument_tokens['spot'] = nifty_spot['instrument_token']
+        print(f"   ✅ NIFTY 50 Spot: {instrument_tokens['spot']}")
+
+        # Find nearest expiry NIFTY futures - in NFO instruments
+        current_date = datetime.date.today()
+        futures_candidates = []
+
+        for inst in nfo_instruments:
+            if (inst['name'] == 'NIFTY' and
+                inst['instrument_type'] == 'FUT' and
+                inst['expiry'] >= current_date):
+                futures_candidates.append(inst)
+
+        if not futures_candidates:
+            print("❌ [WEBSOCKET] No NIFTY futures found")
+            return False
+
+        # Sort by expiry and pick nearest
+        futures_candidates.sort(key=lambda x: x['expiry'])
+        nearest_futures = futures_candidates[0]
+        instrument_tokens['futures'] = nearest_futures['instrument_token']
+        print(f"   ✅ NIFTY Futures: {instrument_tokens['futures']} (expiry: {nearest_futures['expiry']})")
+
+        # Calculate ATM strike for options
+        spot_price = get_current_spot_price_for_atm()
+        if not spot_price:
+            print("❌ [WEBSOCKET] Could not get spot price for ATM calculation")
+            return False
+
+        atm_strike = round(spot_price / 50) * 50
+        print(f"   📊 ATM Strike calculated: ₹{atm_strike} (from spot ₹{spot_price:.2f})")
+
+        # Find closest ATM strike available for options
+        available_strikes = set()
+        for inst in nfo_instruments:
+            if (inst['name'] == 'NIFTY' and
+                inst['instrument_type'] in ['CE', 'PE'] and
+                inst['expiry'] == nearest_futures['expiry']):
+                available_strikes.add(inst['strike'])
+
+        if not available_strikes:
+            print("❌ [WEBSOCKET] No NIFTY options found")
+            return False
+
+        # Find closest strike to our calculated ATM
+        closest_strike = min(available_strikes, key=lambda x: abs(x - atm_strike))
+        print(f"   📊 Using closest available strike: ₹{closest_strike} (instead of ₹{atm_strike})")
+
+        # Find ATM call option with closest strike
+        call_candidates = []
+        for inst in nfo_instruments:
+            if (inst['name'] == 'NIFTY' and
+                inst['instrument_type'] == 'CE' and
+                inst['strike'] == closest_strike and
+                inst['expiry'] == nearest_futures['expiry']):
+                call_candidates.append(inst)
+
+        if not call_candidates:
+            print(f"❌ [WEBSOCKET] ATM call option not found for strike ₹{closest_strike}")
+            return False
+
+        instrument_tokens['call'] = call_candidates[0]['instrument_token']
+        print(f"   ✅ NIFTY Call {closest_strike}: {instrument_tokens['call']}")
+
+        # Find ATM put option with closest strike
+        put_candidates = []
+        for inst in nfo_instruments:
+            if (inst['name'] == 'NIFTY' and
+                inst['instrument_type'] == 'PE' and
+                inst['strike'] == closest_strike and
+                inst['expiry'] == nearest_futures['expiry']):
+                put_candidates.append(inst)
+
+        if not put_candidates:
+            print(f"❌ [WEBSOCKET] ATM put option not found for strike ₹{closest_strike}")
+            return False
+
+        instrument_tokens['put'] = put_candidates[0]['instrument_token']
+        print(f"   ✅ NIFTY Put {closest_strike}: {instrument_tokens['put']}")
+
+        print("✅ [WEBSOCKET] All instrument tokens found successfully")
+        return True
+
+    except Exception as e:
+        print(f"❌ [WEBSOCKET] Instrument lookup failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def get_current_spot_price_for_atm() -> Optional[float]:
+    """
+    Get current NIFTY spot price for ATM strike calculation.
+    Uses REST API since this is only called once at startup.
+    """
+    try:
+        api_key = os.getenv('BROKER_API_KEY')
+        access_token = os.getenv('ZERODHA_ACCESS_TOKEN')
+
+        if not api_key or not access_token:
+            return None
+
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+
+        # Get NIFTY quote - try different parameter formats
+        try:
+            quote = kite.quote(i="256265")  # Try with 'i' parameter
+        except:
+            try:
+                quote = kite.quote("256265")  # Try positional
+            except:
+                quote = None
+
+        if quote and '256265' in quote:
+            return float(quote['256265']['last_price'])
+
+    except Exception as e:
+        print(f"⚠️  [WEBSOCKET] Could not get spot price for ATM: {e}")
+
+    # Fallback to a reasonable ATM strike for testing
+    print("   Using fallback ATM strike: 22100")
+    return 22100.0
 
 # =============================================================================
 # PRICE SIMULATION
@@ -345,7 +865,7 @@ def fetch_prices() -> Dict[str, float]:
     """
     Fetch prices based on trading mode
     PAPER MODE: Uses simulated prices
-    SHADOW MODE: Uses REAL live market data
+    SHADOW MODE: Uses WebSocket live market data (or REST fallback)
     Returns: Dict with spot, futures, call, put prices and dynamic ATM strike
     """
     global NIFTY_ATM_STRIKE
@@ -370,35 +890,49 @@ def fetch_prices() -> Dict[str, float]:
         prices['atm_strike'] = NIFTY_ATM_STRIKE
 
     elif MODE == "SHADOW":
-        # SHADOW MODE: Use REAL live market data with quality validation
-        prices = fetch_live_prices()
+        # SHADOW MODE: Primary - Use WebSocket live market data
+        prices = get_prices_from_cache()
 
-        # ROBUSTNESS GUARD: Validate data quality
-        global previous_prices
-        if not validate_market_data_quality(prices, previous_prices):
-            print("🚫 [SHADOW MODE] Data quality check failed - skipping this tick")
-            # Return previous valid prices if available, otherwise return current (flawed) data
-            # This prevents complete failure but ensures we don't trade on bad data
-            if previous_prices:
-                print("   Using previous valid prices as fallback")
-                prices = previous_prices.copy()
-            else:
-                print("   No previous valid prices available - using current data (with caution)")
+        if prices:
+            # WebSocket data available
+            prices['source'] = 'WEBSOCKET_LIVE'
 
-        # Update previous prices for next validation
-        previous_prices = prices.copy()
-
-        # Update global ATM strike dynamically based on real spot price
-        if 'atm_strike' in prices:
-            NIFTY_ATM_STRIKE = prices['atm_strike']
-            print(f"📊 [ATM UPDATE] Dynamic ATM strike updated to ₹{NIFTY_ATM_STRIKE} based on spot ₹{prices['spot']:.2f}")
+            # Update global ATM strike dynamically based on real spot price
+            if 'atm_strike' in prices and prices['atm_strike']:
+                NIFTY_ATM_STRIKE = prices['atm_strike']
+                print(f"📊 [ATM UPDATE] Dynamic ATM strike updated to ₹{NIFTY_ATM_STRIKE} based on spot ₹{prices['spot']:.2f}")
         else:
-            # Fallback: Calculate ATM strike from spot price
-            spot_price = prices['spot']
-            calculated_atm = round(spot_price / 50) * 50
-            NIFTY_ATM_STRIKE = calculated_atm
-            prices['atm_strike'] = calculated_atm
-            print(f"📊 [ATM UPDATE] Fallback ATM strike calculated as ₹{NIFTY_ATM_STRIKE} from spot ₹{spot_price:.2f}")
+            # FALLBACK: WebSocket not available or incomplete data - use REST API
+            print("⚠️  [SHADOW MODE] WebSocket data unavailable - falling back to REST API")
+            prices = fetch_live_prices()
+
+            # ROBUSTNESS GUARD: Validate data quality
+            global previous_prices
+            if not validate_market_data_quality(prices, previous_prices):
+                print("🚫 [SHADOW MODE] REST fallback data quality check failed")
+                # Return previous valid prices if available, otherwise return current (flawed) data
+                if previous_prices:
+                    print("   Using previous valid prices as fallback")
+                    prices = previous_prices.copy()
+                else:
+                    print("   No previous valid prices available - using current data (with caution)")
+                    prices = prices or {}  # Ensure we have a dict
+
+            # Update previous prices for next validation
+            if prices:
+                previous_prices = prices.copy()
+
+            # Update global ATM strike dynamically based on real spot price
+            if prices and 'atm_strike' in prices:
+                NIFTY_ATM_STRIKE = prices['atm_strike']
+                print(f"📊 [ATM UPDATE] Dynamic ATM strike updated to ₹{NIFTY_ATM_STRIKE} based on spot ₹{prices['spot']:.2f}")
+            elif prices:
+                # Fallback: Calculate ATM strike from spot price
+                spot_price = prices.get('spot', 22000)
+                calculated_atm = round(spot_price / 50) * 50
+                NIFTY_ATM_STRIKE = calculated_atm
+                prices['atm_strike'] = calculated_atm
+                print(f"📊 [ATM UPDATE] Fallback ATM strike calculated as ₹{NIFTY_ATM_STRIKE} from spot ₹{spot_price:.2f}")
 
     else:
         raise ValueError(f"Invalid MODE: {MODE}")
@@ -536,7 +1070,8 @@ def execute_trade(arbitrage: Dict) -> Optional[Dict]:
             'exit_reason': '',
             'exit_time': None,
             'realized_shadow_pnl': 0.0,
-            'duration_seconds': 0
+            'duration_seconds': 0,
+            'exit_candidate_since': None  # Track when parity first dropped below threshold
         }
 
         # Add to global state
@@ -668,7 +1203,7 @@ def monitor_trade(trade: Dict, current_prices: Dict[str, float]) -> bool:
     Works for both PAPER and SHADOW modes
     Returns True if trade should be exited
     """
-    # SHADOW MODE: Simplified monitoring for shadow trades
+    # SHADOW MODE: Enhanced monitoring with time-based parity convergence
     if MODE == "SHADOW" and trade.get('trade_type') == 'SHADOW_ARBITRAGE':
         call_price = current_prices['call']
         put_price = current_prices['put']
@@ -677,16 +1212,51 @@ def monitor_trade(trade: Dict, current_prices: Dict[str, float]) -> bool:
         # Calculate current parity gap
         current_parity_gap = abs((call_price - put_price) - (futures_price - trade['strike_price']))
 
-        # Check parity restoration exit condition
+        # Get current time
+        now = datetime.datetime.now()
+        time_in_trade = (now - trade['entry_time']).total_seconds()
+
+        # 1. TIME-BASED PARITY CONVERGENCE (MANDATORY)
+        # Check if parity gap is below exit threshold
         if current_parity_gap < EXIT_THRESHOLD:
-            trade['exit_reason'] = f"Parity restored: Gap ₹{current_parity_gap:.2f} < ₹{EXIT_THRESHOLD}"
+            # If this is the first time we see parity below threshold
+            if trade['exit_candidate_since'] is None:
+                trade['exit_candidate_since'] = now
+                print(f"[EXIT CANDIDATE] Parity gap ₹{current_parity_gap:.2f} < ₹{EXIT_THRESHOLD} - monitoring for {EXIT_HOLD_TIME}s")
+            # If parity has been below threshold for the required hold time
+            elif (now - trade['exit_candidate_since']).total_seconds() >= EXIT_HOLD_TIME:
+                trade['exit_reason'] = f"Parity converged: Gap ₹{current_parity_gap:.2f} < ₹{EXIT_THRESHOLD} for {EXIT_HOLD_TIME}s"
+                return True
+        else:
+            # Reset exit candidate timer if parity gap goes back above threshold
+            if trade['exit_candidate_since'] is not None:
+                print(f"[EXIT RESET] Parity gap ₹{current_parity_gap:.2f} > ₹{EXIT_THRESHOLD} - resetting timer")
+                trade['exit_candidate_since'] = None
+
+        # 2. HARD MAX TRADE DURATION (MANDATORY)
+        if time_in_trade > MAX_TRADE_DURATION:
+            trade['exit_reason'] = f"Timeout: {time_in_trade:.1f}s > {MAX_TRADE_DURATION}s"
             return True
 
-        # Check time-based exit condition
-        time_in_trade = (datetime.datetime.now() - trade['entry_time']).total_seconds()
-        if time_in_trade > MAX_TRADE_DURATION:
-            trade['exit_reason'] = f"Time limit exceeded ({time_in_trade:.1f}s > {MAX_TRADE_DURATION}s)"
+        # 3. FAILSAFE: STUCK-TRADE DETECTOR (DEFENSIVE)
+        if time_in_trade > 2 * MAX_TRADE_DURATION:
+            trade['exit_reason'] = f"CRITICAL: Stuck trade exceeded 2×max duration ({time_in_trade:.1f}s)"
+            print(f"🚨 CRITICAL: Forced exit of stuck trade {trade['trade_id']}")
             return True
+
+        # 4. EXIT STATE VISIBILITY (LOGGING) - throttled to avoid spam
+        # Log every 5 seconds or when exit candidate status changes
+        exit_candidate_elapsed = None
+        if trade['exit_candidate_since'] is not None:
+            exit_candidate_elapsed = (now - trade['exit_candidate_since']).total_seconds()
+
+        # Log exit watch status (throttled to every 2 seconds to avoid spam)
+        if int(time.time()) % 2 == 0:
+            status_msg = f"[EXIT WATCH] gap={current_parity_gap:.1f}"
+            if exit_candidate_elapsed is not None:
+                status_msg += f" | below_exit_for={exit_candidate_elapsed:.1f}s"
+            status_msg += f" | age={time_in_trade:.0f}s"
+            print(status_msg)
 
         return False
 
@@ -841,6 +1411,31 @@ def reset_daily_counters():
         last_reset_date = today
         print(f"📅 Daily counters reset for {today}")
 
+def get_active_trade_status():
+    """Get detailed status of active trade"""
+    if open_trade is None:
+        return "No active trade"
+
+    trade = open_trade
+    entry_time = trade.get('entry_time', datetime.datetime.now())
+    duration = (datetime.datetime.now() - entry_time).total_seconds()
+
+    if trade.get('trade_type') == 'SHADOW_ARBITRAGE':
+        # SHADOW mode trade
+        parity_gap = trade.get('parity_gap', 0)
+        expected_profit = trade.get('expected_profit', 0)
+        expensive_option = trade.get('expensive_option', 'N/A')
+        cheap_option = trade.get('cheap_option', 'N/A')
+
+        return f"SHADOW: {expensive_option.upper()} vs {cheap_option.upper()}, Gap ₹{parity_gap:.2f}, Expected ₹{expected_profit:.2f}, {duration:.0f}s"
+    else:
+        # PAPER mode trade
+        trade_type = trade.get('trade_type', 'UNKNOWN')
+        position_size = trade.get('position_size', 0)
+        entry_cost = trade.get('entry_cost', 0)
+
+        return f"PAPER: {trade_type}, Size {position_size}, Cost ₹{entry_cost:.2f}, {duration:.0f}s"
+
 def print_status():
     """Print current bot status"""
     open_trades_count = 1 if open_trade is not None else 0
@@ -849,6 +1444,8 @@ def print_status():
 
     print(f"\n📊 BOT STATUS [{mode_indicator} MODE]:")
     print(f"   Open Trades: {open_trades_count}")
+    if open_trade:
+        print(f"   Active Trade: {get_active_trade_status()}")
     print(f"   Daily Trades: {daily_trade_count}/{MAX_TRADES_PER_DAY}")
     print(f"   Trading Enabled: {trading_enabled}")
     print(f"   Total {pnl_type} P&L: ₹{total_pnl:.2f}")
@@ -857,8 +1454,91 @@ def print_status():
     else:
         print(f"   [SHADOW MODE - NO REAL CAPITAL AT RISK]")
 
+def print_session_summary():
+    """Print comprehensive session summary on exit"""
+    mode_indicator = "SHADOW" if MODE == "SHADOW" else "PAPER"
+    pnl_type = "Hypothetical" if MODE == "SHADOW" else "Simulated"
+
+    print("\n" + "="*60)
+    print("📊 SESSION SUMMARY")
+    print("="*60)
+    print(f"Mode: {mode_indicator} TRADING")
+    print(f"Total {pnl_type} P&L: ₹{total_pnl:.2f}")
+
+    if MODE == "PAPER":
+        print(f"Initial Capital: ₹{INITIAL_CAPITAL:.2f}")
+        print(f"Final Capital: ₹{INITIAL_CAPITAL + total_pnl:.2f}")
+        capital_change = ((total_pnl / INITIAL_CAPITAL) * 100) if INITIAL_CAPITAL > 0 else 0
+        print(f"Capital Change: {capital_change:+.2f}%")
+
+    print(f"Total Trades Executed: {len(trades)}")
+    print(f"Daily Trade Limit: {MAX_TRADES_PER_DAY} (used {daily_trade_count})")
+
+    # Active trade status
+    if open_trade:
+        print(f"\n🚨 ACTIVE TRADE WARNING:")
+        print(f"   {get_active_trade_status()}")
+        print("   ⚠️  Trade is still open - monitor manually if needed")
+    else:
+        print("\n✅ No active trades - clean exit")
+
+    # Trade performance summary
+    if trades:
+        winning_trades = 0
+        losing_trades = 0
+        total_profit = 0
+        total_loss = 0
+
+        for trade in trades:
+            if trade.get('trade_type') == 'SHADOW_ARBITRAGE':
+                pnl = trade.get('realized_shadow_pnl', 0)
+            else:
+                pnl = trade.get('realized_pnl', 0)
+
+            if pnl > 0:
+                winning_trades += 1
+                total_profit += pnl
+            elif pnl < 0:
+                losing_trades += 1
+                total_loss += abs(pnl)
+
+        win_rate = (winning_trades / len(trades) * 100) if trades else 0
+
+        print(f"\n📈 TRADE PERFORMANCE:")
+        print(f"   Win Rate: {win_rate:.1f}% ({winning_trades}W / {losing_trades}L)")
+        print(f"   Total Profit: ₹{total_profit:.2f}")
+        print(f"   Total Loss: ₹{total_loss:.2f}")
+        if losing_trades > 0:
+            avg_win = total_profit / winning_trades if winning_trades > 0 else 0
+            avg_loss = total_loss / losing_trades
+            profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+            print(f"   Avg Win: ₹{avg_win:.2f}, Avg Loss: ₹{avg_loss:.2f}")
+            print(f"   Profit Factor: {profit_factor:.2f}")
+
+    # Trading time
+    session_start = None
+    session_end = datetime.datetime.now()
+
+    if trades:
+        session_start = min(trade.get('entry_time', session_end) for trade in trades)
+    else:
+        # Find when the bot started by looking at first price fetch
+        session_start = session_end - datetime.timedelta(seconds=60)  # Estimate
+
+    session_duration = session_end - session_start
+    hours = session_duration.total_seconds() / 3600
+
+    print(f"\n⏰ SESSION TIME:")
+    print(f"   Duration: {hours:.2f} hours")
+    print(f"   Trades per Hour: {len(trades)/hours:.2f}" if hours > 0 else "   Trades per Hour: N/A")
+
+    print("="*60)
+
 def main():
-    """Main bot execution loop"""
+    """Main bot execution loop with WebSocket-based live data"""
+    # Global variable declarations (must be at function start)
+    global open_trade, trading_enabled, daily_trade_count, total_pnl
+
     mode_indicator = "🔴 SHADOW TRADING" if MODE == "SHADOW" else "📝 PAPER TRADING"
     print(f"🚀 Starting SAFE {mode_indicator} Options Arbitrage Bot")
     print("=" * 60)
@@ -867,23 +1547,88 @@ def main():
     print(f"Max Capital per Trade: {MAX_CAPITAL_PER_TRADE:.1%}")
     print(f"Max Trades per Day: {MAX_TRADES_PER_DAY}")
     print(f"Trading disabled after loss: {DISABLE_AFTER_LOSS}")
+
+    # WEBSOCKET INITIALIZATION (SHADOW MODE ONLY)
+    websocket_ticker = None
     if MODE == "SHADOW":
-        print("🏦 [SHADOW MODE – BROKER DATA – NO TRADING]")
-        print("   Using LIVE BROKER market data APIs - NO REAL ORDERS PLACED")
+        print("[SHADOW MODE – WEBSOCKET DATA – NO TRADING]")
+        print("🏦 Using LIVE WEBSOCKET market data - NO REAL ORDERS PLACED")
         print("   All trades are hypothetical simulations only")
-        print("   Broker: " + os.getenv('BROKER_NAME', 'GENERIC_BROKER'))
+        print("   Data Source: Zerodha KiteTicker WebSocket")
+        print("   Arbitrage detection: Automatic on live ticks (500ms throttled)")
+
+        # Lookup instrument tokens
+        if not lookup_instrument_tokens():
+            print("❌ [WEBSOCKET] Failed to lookup instrument tokens - cannot proceed")
+            return
+
+        # Initialize WebSocket
+        websocket_ticker = initialize_websocket()
+        if not websocket_ticker:
+            print("❌ [WEBSOCKET] Failed to initialize WebSocket - cannot proceed")
+            return
+
+        # Start heartbeat loop first (runs in background thread)
+        start_heartbeat_loop()
+
+        # Start WebSocket connection (runs in main thread)
+        try:
+            websocket_ticker.start()
+            print("✅ [WEBSOCKET] WebSocket started successfully")
+        except Exception as e:
+            print(f"❌ [WEBSOCKET] Failed to start WebSocket: {e}")
+            shutdown_handler.set_shutdown()  # Stop heartbeat loop
+            stop_heartbeat_loop()
+            return
+
     print("=" * 60)
 
-    try:
-        while True:
+    if MODE == "SHADOW":
+        # SHADOW MODE: WebSocket event loop becomes the main execution
+        # Arbitrage detection happens in WebSocket event handlers
+        print("🚀 Starting WebSocket event loop...")
+        print("   Press Ctrl+C to stop")
+
+        try:
+            # Start the WebSocket
+            websocket_ticker.start()
+        except KeyboardInterrupt:
+            print("\n🛑 Ctrl+C detected - shutting down...")
+            shutdown_handler.set_shutdown()
+            if websocket_ticker:
+                websocket_ticker.stop()
+            stop_heartbeat_loop()
+            print_session_summary()
+            return
+        except Exception as e:
+            print(f"\n❌ WebSocket failed: {e}")
+            shutdown_handler.set_shutdown()
+            stop_heartbeat_loop()
+            print_session_summary()
+            return
+
+        # WebSocket has exited normally
+        shutdown_handler.set_shutdown()
+        stop_heartbeat_loop()
+        print_session_summary()
+
+    elif MODE == "PAPER":
+        # PAPER MODE: Traditional polling loop
+        print("🚀 Starting PAPER mode trading loop...")
+        print("   Press Ctrl+C to stop")
+
+        while not shutdown_handler.is_shutdown_set():
             # Reset daily counters if needed
             reset_daily_counters()
 
-            # Fetch current prices
             prices = fetch_prices()
             timestamp = datetime.datetime.fromtimestamp(prices['timestamp'])
 
-            print(f"\n⏰ {timestamp.strftime('%H:%M:%S')} - Prices Updated")
+            active_trade_info = ""
+            if open_trade:
+                active_trade_info = f" | {get_active_trade_status()}"
+
+            print(f"\n⏰ {timestamp.strftime('%H:%M:%S')} - Prices Updated{active_trade_info}")
             print(f"   NIFTY Spot: ₹{prices['spot']:.2f}")
             print(f"   NIFTY Futures: ₹{prices['futures']:.2f}")
             print(f"   ATM Call: ₹{prices['call']:.2f}")
@@ -893,44 +1638,24 @@ def main():
             # Check for arbitrage opportunities
             arbitrage = detect_arbitrage(prices)
             if arbitrage:
-                # The arbitrage detection already prints detailed information
                 trade = execute_trade(arbitrage)
             else:
                 print("   No arbitrage opportunity detected")
 
             # Monitor existing trade (only one at a time)
-            global open_trade
             if open_trade is not None and monitor_trade(open_trade, prices):
                 exit_trade(open_trade, prices)
 
-            # Print status every 10 updates
-            if int(time.time()) % 30 < UPDATE_INTERVAL:  # Roughly every 30 seconds
+            # Print status every 30 seconds
+            if int(time.time()) % 30 == 0:
                 print_status()
 
-            # Wait for next update
             time.sleep(UPDATE_INTERVAL)
 
-    except KeyboardInterrupt:
+        # Shutdown signal received
         print("\n🛑 Bot stopped by user")
-        print_status()
+        print_session_summary()
 
-        # Print trade summary
-        if trades:
-            print("\n📈 TRADE SUMMARY:")
-            for trade in trades:
-                duration = (trade['exit_time'] - trade['entry_time']).total_seconds() if trade['exit_time'] else 0
-
-                # Handle different P&L fields for PAPER vs SHADOW trades
-                if trade.get('trade_type') == 'SHADOW_ARBITRAGE':
-                    pnl = trade.get('realized_shadow_pnl', 0.0)
-                    pnl_type = "Hypothetical"
-                else:
-                    pnl = trade.get('realized_pnl', 0.0)
-                    pnl_type = "Realized"
-
-                print(f"   {trade['trade_id']}: {pnl_type} P&L ₹{pnl:.2f}, Duration {duration:.1f}s, Status {trade['status']}")
-        else:
-            print("\n📈 No trades executed")
 
 if __name__ == "__main__":
     main()
